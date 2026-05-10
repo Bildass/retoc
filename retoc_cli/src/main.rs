@@ -787,11 +787,21 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
 
     let files = input.list_files()?;
     let files_set: HashSet<&UEPathBuf> = HashSet::from_iter(files.iter());
+    // Files that aren't IoStore-bound (descriptors, configs, plugins) get passed through to the output legacy pak.
+    // Without this, retoc to-zen produced an empty placeholder pak and the game crashed on missing .uproject / .ini.
+    let mut passthrough_paths: Vec<&UEPathBuf> = Vec::new();
 
     for path in &files {
         let ue_path = UEPath::new(&path);
         let ext = ue_path.extension();
         let is_asset = [Some("uasset"), Some("umap")].contains(&ext);
+        let is_asset_companion = [Some("uexp"), Some("ubulk"), Some("uptnl")].contains(&ext)
+            || path.as_str().ends_with(".m.ubulk");
+        let is_shader_lib = Some("ushaderbytecode") == ext;
+        let is_shader_meta = path.as_str().ends_with(".uasset.metadata")
+            || path.as_str().ends_with(".ushaderbytecode.metadata");
+        let is_scriptobjects = path.file_name() == Some("scriptobjects.bin");
+
         if is_asset && check_path(path) {
             let uexp = ue_path.with_extension("uexp");
             if files_set.contains(&uexp) {
@@ -799,15 +809,15 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
             } else {
                 info!(&log, "Skipping {path} because it does not have a split exports file. Are you sure the package is cooked?");
             }
-        }
-        let is_shader_lib = Some("ushaderbytecode") == ext;
-        if is_shader_lib && check_path(path) {
+        } else if is_shader_lib && check_path(path) {
             shader_lib_paths.push(path);
-        }
-        // If folder we are given contains copy of script objects, parse them and use them for VNI support and import checking
-        if toc_version > EIoStoreTocVersion::PerfectHash && path.file_name() == Some("scriptobjects.bin") {
+        } else if is_scriptobjects && toc_version > EIoStoreTocVersion::PerfectHash {
+            // If folder we are given contains copy of script objects, parse them and use them for VNI support and import checking
             let script_object_buffer = input.read(path).with_context(|| format!("Failed to read script objects file: {}", path))?;
             script_objects = Some(Arc::new(ZenScriptObjects::deserialize_new(&mut Cursor::new(script_object_buffer))?));
+        } else if !is_asset && !is_asset_companion && !is_shader_lib && !is_shader_meta && !is_scriptobjects {
+            // Loose file (descriptor, ini, plugin metadata) — pass through to the output pak unmodified
+            passthrough_paths.push(path);
         }
     }
 
@@ -934,12 +944,41 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
 
     writer.finalize()?;
 
-    // create empty pak file if one does not already exist (necessary for game to detect and load container)
+    // Always (re)create the companion .pak. If we have passthrough files (legacy pak input
+    // typically contains .uproject / *.ini / FilterPlugin.ini that the engine needs to boot),
+    // write them through. Otherwise emit an empty pak so the game still detects the container.
     let pak_path = Path::new(&args.output).with_extension("pak");
-    if !pak_path.exists() {
-        repak::PakBuilder::new().writer(&mut BufWriter::new(fs::File::create(pak_path)?), repak::Version::V11, mount_point.to_string(), None).write_index()?;
+    let mut pak_file = BufWriter::new(fs::File::create(&pak_path)?);
+    let mut pak_builder = repak::PakBuilder::new().writer(
+        &mut pak_file,
+        repak::Version::V11,
+        mount_point.to_string(),
+        None,
+    );
+
+    if !passthrough_paths.is_empty() {
+        info!(
+            &log,
+            "Passing through {} loose files (descriptors, configs) into {}",
+            passthrough_paths.len(),
+            pak_path.display()
+        );
+        let entry_builder = pak_builder.entry_builder();
+        // Build entries first (can be parallelized), then sequentially write them through the pak builder.
+        let entries: Result<Vec<(String, repak::PartialEntry<Vec<u8>>)>> = passthrough_paths
+            .par_iter()
+            .map(|path| {
+                let data = input.read(path).with_context(|| format!("Failed to read passthrough file {}", path))?;
+                let entry = entry_builder.build_entry(false, data)?;
+                Ok((path.as_str().to_string(), entry))
+            })
+            .collect();
+        for (path, entry) in entries? {
+            pak_builder.write_entry(path, entry)?;
+        }
     }
 
+    pak_builder.write_index()?;
     Ok(())
 }
 
